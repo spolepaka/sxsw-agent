@@ -2,17 +2,19 @@
   "name": "twilio-test-service",
   "version": "1.0.0",
   "description": "A simple test service to verify Twilio connection and OpenAI integration",
-  "main": "twilio-test-service.js",
+  "main": "twilio-service.js",
   "type": "module",
   "scripts": {
-    "start": "node twilio-test-service.js",
+    "start": "node twilio-service.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "@deepgram/sdk": "^3.11.2",
     "@fastify/formbody": "^7.4.0",
     "@fastify/websocket": "^8.2.0",
+    "@pinecone-database/pinecone": "^5.1.1",
     "alawmulaw": "^6.0.0",
+    "crawlee": "^3.13.0",
     "dotenv": "^16.3.1",
     "fastify": "^4.24.3",
     "fluent-ffmpeg": "^2.1.3",

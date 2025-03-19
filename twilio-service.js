@@ -11,6 +11,8 @@ import fs from 'fs';
 import path from 'path';
 import { exec } from 'child_process';
 import fetch from 'node-fetch';
+import { findRelevantContext } from './modules/knowledgeProcessor.js';
+import { isVectorStoreInitialized } from './modules/vectorStore.js';
 
 // Helper function to convert stream to audio buffer
 async function getAudioBuffer(response) {
@@ -172,6 +174,26 @@ logger.debug('Environment variables loaded', {
 
 logger.info(`Starting Twilio Test Service with log level: ${Object.keys(LOG_LEVELS).find(key => LOG_LEVELS[key] === logLevel)}`);
 
+// Initialize the knowledge base
+let knowledgeBaseLoaded = false;
+(async () => {
+  try {
+    logger.info('Checking vector store accessibility...');
+    const isInitialized = await isVectorStoreInitialized();
+    knowledgeBaseLoaded = isInitialized;
+    if (isInitialized) {
+      logger.info('Vector store is accessible and ready for queries');
+    } else {
+      logger.error('Vector store is not initialized. Please run crawl-knowledge-base.js first');
+    }
+  } catch (error) {
+    logger.error('Failed to check vector store accessibility', {
+      error: error.message,
+      stack: error.stack
+    });
+  }
+})();
+
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -276,7 +298,7 @@ IMPORTANT:
 
 Example valid response:
 {
-  "response": "Hey there! I'd love to tell you about the AI events at SXSW 2025. What specific aspects interest you the most?",
+  "response": "SXSW 2025 features several AI workshops in the Interactive Track, including 'AI Ethics in Content Creation' on March 12 and 'Hands-on Machine Learning for Beginners' on March 15. Both workshops are at the Austin Convention Center.",
   "end_conversation": false
 }
 
@@ -287,34 +309,11 @@ Set "end_conversation" to true when:
 - Natural conversation end point is reached
 
 CONVERSATIONAL STYLE GUIDELINES:
-1. Start by asking short, clarifying questions to clearly understand what the user is looking for.
-2. Validate the user's intent clearly before providing detailed information.
-3. After providing information, validate again by asking if the response answered their question.
-4. Use a casual, upbeat, and engaging tone—think friendly festival guide.
-5. Include natural pauses using commas and ellipses (. . .) to mimic conversational rhythm.
-6. Break responses into short, digestible sentences.
-7. Use contractions (I'm, you're, let's) to maintain a relaxed, conversational feel.
-8. Highlight exciting events, keynotes, performances, and interactive experiences at SXSW 2025.
-9. Use exclamation marks sparingly to emphasize particularly exciting or unique events.
-10. Avoid overly complex punctuation or jargon that doesn't translate well to speech.
-11. Insert occasional verbal fillers like "um," "uh," "well," or "you know" to sound more human.
-
-When ending the conversation:
-- Provide a contextual goodbye based on what was discussed
-- Thank the user for their interest
-- Wish them a great time at SXSW 2025
-- Keep the farewell message concise and friendly
-
-KEY SXSW 2025 HIGHLIGHTS:
-- Interactive Track: AI & emerging tech showcases
-- Film & TV Festival: Premieres and screenings
-- Music Festival: Live performances across Austin
-- Keynote speakers and industry leaders
-- Networking events and creative meetups
-- Innovation awards and competitions
-- Special focus on sustainability and future tech
-
-Provide concise, helpful, and engaging information about SXSW 2025 events, speakers, performances, venues, and Austin's local attractions relevant to attendees.`;
+1. Be concise and direct - prioritize giving complete information rather than asking clarifying questions.
+2. Provide specific details like dates, times, locations, and speakers when available.
+3. Only ask a clarifying question if the user's request is genuinely ambiguous and you cannot provide a good answer.
+4. Use a casual, upbeat tone—think friendly festival guide, but focus on substance over style.
+5. If you don't have the specific information requested, be honest and suggest related information you do have.`;
 
 // Global state for transcription and processing
 const transcriptionBuffer = {
@@ -601,10 +600,52 @@ async function processBufferedTranscription(socket, sid, chatHistory, deepgramLi
   
   // Add user's query to conversation history
   chatHistory.push({ role: 'user', content: query });
-  
+
   try {
     // Set response in progress flag to prevent concurrent responses
     responseInProgress = true;
+    
+    // First, find relevant context from the knowledge base
+    let knowledgeContext = '';
+    if (knowledgeBaseLoaded) {
+      logger.info('Retrieving relevant knowledge base context for query...');
+      try {
+        knowledgeContext = await findRelevantContext(query);
+        if (knowledgeContext) {
+          logger.debug('Retrieved knowledge context', {
+            contextLength: knowledgeContext.length,
+            hasContent: knowledgeContext.length > 0 ? 'Yes' : 'No'
+          });
+        } else {
+          logger.warn('No knowledge context found for query');
+        }
+      } catch (error) {
+        // Log the full error details
+        logger.error('Error retrieving knowledge context', {
+          error: error.message,
+          stack: error.stack,
+          query
+        });
+        
+        // If it's a vector store error, try to reinitialize
+        if (error.message.includes('vector store')) {
+          logger.info('Attempting to reinitialize vector store...');
+          try {
+            await initializeVectorStore();
+            // Try the search again after reinitialization
+            knowledgeContext = await findRelevantContext(query);
+            logger.info('Successfully reinitialized vector store and retrieved context');
+          } catch (reinitError) {
+            logger.error('Failed to reinitialize vector store', {
+              error: reinitError.message,
+              stack: reinitError.stack
+            });
+          }
+        }
+      }
+    } else {
+      logger.info('Knowledge base not loaded yet, proceeding without context');
+    }
     
     // Get response from ChatGPT
     logger.info('Requesting ChatGPT response');
@@ -622,25 +663,60 @@ async function processBufferedTranscription(socket, sid, chatHistory, deepgramLi
         return;
       }
       
+      // Prepare the system prompt with knowledge context if available
+      let enhancedSystemPrompt = systemPrompt;
+      if (knowledgeContext) {
+        logger.info('Enhanced system prompt with knowledge context');
+        
+        enhancedSystemPrompt += `
+
+RELEVANT KNOWLEDGE BASE INFORMATION:
+${knowledgeContext}
+
+IMPORTANT INSTRUCTIONS FOR USING KNOWLEDGE:
+1. Use the specific details from the knowledge base documents above to answer the user's query.
+2. Include concrete information like dates, locations, and event names from the documents.
+3. If the knowledge base contains relevant information, prefer that over general knowledge.
+4. If the knowledge base doesn't contain relevant information, clearly state this and provide general information about SXSW.
+5. Do not ask clarifying questions unless absolutely necessary - prefer to give the most relevant information directly.
+`;
+        
+        // Log a sample of the knowledge context to verify what's being sent
+        logger.debug('Knowledge context sample:', {
+          contentLength: knowledgeContext.length,
+          sample: knowledgeContext.substring(0, 300) + '...'
+        });
+      }
+      
       // Create messages array with system prompt
       const messages = [
         { 
           role: 'system', 
-          content: systemPrompt + "\n\nREMINDER: Format your response as a valid JSON object with 'response' and 'end_conversation' fields."
+          content: enhancedSystemPrompt + "\n\nREMINDER: Format your response as a valid JSON object with 'response' and 'end_conversation' fields."
         },
         ...chatHistory
       ];
       
-      logger.debug('Sending request to OpenAI', { messageCount: messages.length });
+      // Log the full system prompt and messages being sent to OpenAI
+      logger.debug('System prompt:', {
+        promptLength: messages[0].content.length,
+        prompt: messages[0].content.substring(0, 500) + '...'
+      });
+      
+      logger.debug('Sending request to OpenAI', { 
+        messageCount: messages.length,
+        historyLength: chatHistory.length,
+        userQuery: query
+      });
       
       const openAIStream = await openai.chat.completions.create({
-        model: 'gpt-4-1106-preview',  // Updated to latest model that supports JSON mode
+        model: 'gpt-4o-mini',  // Changed from gpt-4-1106-preview to faster model
         messages: messages,
-        max_tokens: 250,
-        temperature: 0.8,
+        max_tokens: 150,  // Reduced from 250 to 150 for faster responses
+        temperature: 0.4,  // Lower temperature for more direct, factual responses
         stream: true,
-        presence_penalty: 0.6,
-        frequency_penalty: 0.5,
+        presence_penalty: 0.2,  // Lower presence penalty to reduce tendency to introduce new topics
+        frequency_penalty: 0.3,  // Lower frequency penalty to allow some term repetition for clarity
         response_format: { type: "json_object" },  // This enforces JSON output
         seed: 42  // Optional: for more consistent responses
       });
